@@ -1,8 +1,8 @@
 # 05 - 线阵 CCD 接口与采集协处理器子系统：从传感器驱动到 UART 串口通信
 
 **文档编号**: WIKI-HEAD-05  
-**项目分支**: `head` (ESP32 芦笋测长测径单元)  
-**关联文档**: [01 - 芦笋外径测量技术方案论证报告](01_how_to_measure_diameter.md) | [03 - 线阵 CCD 传感器选型与参数对照](03_linear_ccd_sensors_guide.md) | [04 - 方案二工程深化设计](04_scheme2_linear_ccd_detailed_design.md)  
+**项目分支**: `ccd_eye` (线阵 CCD 智能测径相机系统)  
+**关联文档**: [01 - 芦笋外径测量技术方案论证报告](../../head/wiki/01_how_to_measure_diameter.md) | [02 - 机器视觉光学基础与镜头选型解析](02_optical_concepts_guide.md) | [03 - 线阵 CCD 传感器选型与参数对照](03_linear_ccd_sensors_guide.md) | [04 - 方案二工程深化设计](04_scheme2_linear_ccd_detailed_design.md)  
 **状态**: 硬件与固件设计规范 (Hardware & Firmware Subsystem Specification)  
 **创建时间**: 2026-10-10  
 
