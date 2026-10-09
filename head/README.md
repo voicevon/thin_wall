@@ -74,10 +74,13 @@
 5. **计算有效长度 (绿长)**:
    $$\text{Length}_{\text{green}} (\text{mm}) = \frac{\text{Steps}_{\text{boundary}} - P_0}{\text{STEPS\_PER\_MM\_CONVEYOR}}$$
    - 测径暂停期间输送电机不走步，不影响计算结果。
-6. **送出物料与停机判据**:
+6. **交接出料与后机握手判据 (背压互锁)**:
    - 捕捉白根后输送电机继续低速前移，直到**传感器 2 读数恢复背景色**（芦笋尾部离开）；
-   - 再额外前送 `EJECT_DISTANCE_MM`（默认 50mm），把芦笋送入出料区；
-   - 输送电机停机，发送测量结果，回到 **IDLE**。
+   - **检查下游状态 (必须原地等待)**:
+     - 输送电机立即暂停，检查下游 `body_1` 的运行状态（通过数据串口 RX 监听）；
+     - **若后机处于 `RECEIVING` 或 `SENDING`（或超时未收到状态心跳），输送电机严禁推进，数据包严禁发送，必须原地暂停等待**；
+     - **只有检测到后机状态为 `IDLE` (空闲)**，`head` 才向下游发送测量数据包，并启动输送电机推进 `EJECT_DISTANCE_MM`（默认 50mm），将芦笋交接给 `body_1` 的传送带；
+   - 推进完成后输送电机停机，系统回到 **IDLE** 待机，等待下一根放入。
 
 **间距 $D$ 的取值约束**:
 - **减速距离**: 必须在 $D$ 内从高速降到低速：
@@ -100,23 +103,35 @@
    - 扫描完成后 Y 轴回零，同时 **输送电机按暂停前的速度档恢复推进**（需确认 Y 轴回程与物料、传送带之间无机械干涉）；
    - 若芦笋尾部在到达测径点前已经离开传感器 2（芦笋过短），则跳过测径，`status` 标记为 `NO_DIAMETER`。
 
-### 3.4 测量数据对外通信传输
+### 3.4 双向通信与后机背压握手协议
 - 数据串口由宏定义（`DATA_UART_NUM` / `DATA_UART_TX_PIN` / `DATA_UART_RX_PIN` / `DATA_UART_BAUD`），默认 **UART2，115200**；
-- **UART0 (GPIO 1/3) 只用于 USB 下载与调试日志**，避免日志混入数据流；
-- 每次检测完成输出一行 JSON（只包含测量值，不含等级）：
-  ```json
-  {
-    "item_id": 1024,
-    "green_length_mm": 185.4,
-    "diameter_mm": 12.8,
-    "status": "OK"
-  }
-  ```
-- `status` 取值：`OK` / `NO_DIAMETER` / `FAULT_TRAVEL` / `FAULT_SENSOR`。
+- **全双工双向交互**：
+  - **TX (前向交接)**：后机处于 `IDLE` 时，发送单行 JSON 测量数据包：
+    ```json
+    {
+      "item_id": 1024,
+      "green_length_mm": 185.4,
+      "diameter_mm": 12.8,
+      "status": "OK"
+    }
+    ```
+  - **RX (反向状态监听)**：接收下游后机（`body_1`）定时广播的设备状态心跳包（周期默认 50ms）：
+    ```json
+    {
+      "node": 1,
+      "state": "IDLE"
+    }
+    ```
+    - 后机状态枚举值：
+      - `"IDLE"`: 空闲（可以接料与接收数据）；
+      - `"RECEIVING"`: 接收中（物料正在进入后机，前机严禁发送）；
+      - `"SENDING"`: 发送中 / 执行分选动作中（前机严禁发送）；
+- **UART0 (GPIO 1/3) 专用于 USB 下载与调试日志**，不参与工业数据交互。
 
 ### 3.5 异常与超时保护机制
 - **极简工程原则 (YAGNI)**: 默认人工规范放料，不预设复杂的形状拦截算法；
 - **单根节拍**: 一次只处理一根芦笋，回到 IDLE 之前不响应新的放料；
+- **后机握手超时**: 若物料测完后下游长时间（超过 `DOWNSTREAM_TIMEOUT_MS`）未上报 `IDLE`，进入告警等待，禁止强制出料；
 - **防空转与防卡料**（任意运行状态下都可能触发）:
   - **最大前送位移**: 单次累计位移超过 `MAX_TRAVEL_MM`（如 600mm）仍未完成，强制停机，`status = FAULT_TRAVEL`；
   - **采样超时**: 传感器连续读取失败或超时，输送电机停机，`status = FAULT_SENSOR`；
@@ -156,14 +171,14 @@ stateDiagram-v2
         SLOW_SCAN --> Y_MEASURE : 到达测径点 (输送暂停)
         Y_MEASURE --> FAST_ADV : 测径完成，恢复原速度档
         Y_MEASURE --> SLOW_SCAN : 测径完成，恢复原速度档
-        SLOW_SCAN --> EJECT : 传感器2恢复背景色
-        EJECT --> REPORT : 已前送 EJECT_DISTANCE_MM，输送停机
-        REPORT --> [*] : 发送测量 JSON
+        SLOW_SCAN --> WAIT_DOWNSTREAM : 传感器2恢复背景色 (输送暂停，等待后机空闲)
+        WAIT_DOWNSTREAM --> EJECT : 收到后机状态为 IDLE (发数据包并启动出料)
+        EJECT --> [*] : 已前送 EJECT_DISTANCE_MM，交接完成
     }
 
     IDLE --> RUNNING : 传感器1检测到物料
-    RUNNING --> IDLE : 本根完成
-    RUNNING --> FAULT : 超出最大位移 / 采样超时
+    RUNNING --> IDLE : 交接完成
+    RUNNING --> FAULT : 超出最大位移 / 采样超时 / 后机响应超时
     FAULT --> Y_HOMING : 输送停机，上报故障包
 ```
 
@@ -188,10 +203,11 @@ stateDiagram-v2
 | `LASER_OFFSET_MM` | TBD | 测径工位距传感器 2 的距离 |
 | `DIAM_POINT_MM` | TBD | 测量点距芦笋头部的距离 |
 | `LASER_SPOT_MM` | TBD | 激光光斑直径 |
-| `EJECT_DISTANCE_MM` | 50 | 尾部离开后的额外前送距离 |
+| `EJECT_DISTANCE_MM` | 50 | 尾部离开后送入下游车厢的交接距离 |
 | `MAX_TRAVEL_MM` | 600 | 单次最大前送位移 |
+| `DOWNSTREAM_TIMEOUT_MS` | 5000 | 等待下游车厢空闲的超时时间 |
 | `DATA_UART_NUM` / `DATA_UART_BAUD` | 2 / 115200 | 数据串口编号与波特率 |
-| `DATA_UART_TX_PIN` / `DATA_UART_RX_PIN` | 14 / 34 | 数据串口引脚 |
+| `DATA_UART_TX_PIN` / `DATA_UART_RX_PIN` | 14 / 34 | 数据串口引脚 (TX 发往后机, RX 接收后机状态) |
 
 ---
 
