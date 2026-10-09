@@ -14,15 +14,16 @@ Adafruit_TCS34725 tcs1 = Adafruit_TCS34725(TCS_INTEGRATION_TIME, TCS_GAIN);
 Adafruit_TCS34725 tcs2 = Adafruit_TCS34725(TCS_INTEGRATION_TIME, TCS_GAIN);
 
 // 状态机枚举
+// 核心状态机枚举 (Head 测量火车头工作状态)
 enum HeadState {
-    STATE_Y_HOMING = 0,
-    STATE_IDLE,
-    STATE_FAST_ADV,
-    STATE_SLOW_SCAN,
-    STATE_Y_MEASURE,
-    STATE_WAIT_DOWNSTREAM,
-    STATE_EJECT,
-    STATE_FAULT
+    STATE_Y_HOMING = 0,     // Y 轴测径电机回零归位 (上电复位)
+    STATE_IDLE,             // 待机空闲：输送静止，等待放入芦笋
+    STATE_FAST_ADV,         // 高速推进：传感器 1 侦测到进料，输送电机高速向前推进
+    STATE_SLOW_SCAN,        // 低速精测：传感器 1 预警白根，平滑降速供传感器 2 高精捕捉分界点
+    STATE_Y_MEASURE,        // 激光扫径：到达测径工位，输送电机短暂停机，Y 轴横向扫描测外径
+    STATE_WAIT_DOWNSTREAM,  // 等待后机空闲：测长完成，输送电机原地暂停，等待下游车厢报告 IDLE
+    STATE_EJECT,            // 出料交接：下游空闲，发送测量 JSON 数据并推进固定位移交接芦笋
+    STATE_FAULT             // 故障保护：防空转超程或传感器采样异常，停机告警并等待复位
 };
 
 HeadState currentState = STATE_Y_HOMING;
@@ -47,22 +48,32 @@ static char serial2RxBuf[128];
 static size_t serial2RxIdx = 0;
 
 // ==================== 辅助传感器函数 ====================
+// 颜色类别互斥枚举
+enum class ColorType {
+    BACKGROUND = 0, // 背景底色 / 空载 (无物料)
+    GREEN,          // 绿色嫩茎
+    WHITE,          // 白根
+    TRANSITION      // 绿白过渡区 / 未定 (落在 GREEN 与 WHITE 阈值之间)
+};
+
 struct ColorSample {
     uint16_t r, g, b, c;
-    bool isBackground() const {
-        return c < BG_CLEAR_THRESHOLD;
-    }
-    bool isGreen() const {
-        if (isBackground()) return false;
+
+    ColorType getType() const {
+        if (c < BG_CLEAR_THRESHOLD) {
+            return ColorType::BACKGROUND;
+        }
         float total = (float)(r + g + b);
-        if (total <= 0.0f) return false;
-        return ((float)g / total) >= GREEN_RATIO_THRESHOLD;
-    }
-    bool isWhite() const {
-        if (isBackground()) return false;
-        float total = (float)(r + g + b);
-        if (total <= 0.0f) return false;
-        return ((float)g / total) <= WHITE_RATIO_THRESHOLD;
+        if (total <= 0.0f) return ColorType::BACKGROUND;
+
+        float gRatio = (float)g / total;
+        if (gRatio >= GREEN_RATIO_THRESHOLD) {
+            return ColorType::GREEN;
+        }
+        if (gRatio <= WHITE_RATIO_THRESHOLD) {
+            return ColorType::WHITE;
+        }
+        return ColorType::TRANSITION;
     }
 };
 
@@ -237,7 +248,7 @@ void loop() {
         case STATE_IDLE: {
             stepperConveyor.stop();
             ColorSample s1 = readSensor1();
-            if (!s1.isBackground()) {
+            if (s1.getType() != ColorType::BACKGROUND) {
                 // 物料放入触发
                 Serial.println("[Head] Sensor #1 triggered! Starting high speed feed.");
                 stepperConveyor.setCurrentPosition(0);
@@ -259,7 +270,7 @@ void loop() {
             // 传感器 2 捕捉绿头起点 P0
             if (!p0Recorded) {
                 ColorSample s2 = readSensor2();
-                if (s2.isGreen()) {
+                if (s2.getType() == ColorType::GREEN) {
                     stepP0 = stepperConveyor.currentPosition();
                     p0Recorded = true;
                     Serial.printf("[Head] Green head detected at P0 = %ld steps\n", stepP0);
@@ -278,7 +289,7 @@ void loop() {
 
             // 传感器 1 侦测白根预警 (前哨降速)
             ColorSample s1 = readSensor1();
-            if (s1.isWhite()) {
+            if (s1.getType() == ColorType::WHITE) {
                 Serial.println("[Head] Sensor #1 detected white root! Slowing down...");
                 stepperConveyor.setMaxSpeed(CONVEYOR_SPEED_LOW_MMPS * STEPS_PER_MM_CONVEYOR);
                 stepperConveyor.setSpeed(CONVEYOR_SPEED_LOW_MMPS * STEPS_PER_MM_CONVEYOR);
@@ -302,7 +313,7 @@ void loop() {
 
             // 传感器 2 捕获绿白分界点
             ColorSample s2 = readSensor2();
-            if (!boundaryRecorded && s2.isWhite()) {
+            if (!boundaryRecorded && s2.getType() == ColorType::WHITE) {
                 stepBoundary = stepperConveyor.currentPosition();
                 boundaryRecorded = true;
                 if (p0Recorded && stepBoundary >= stepP0) {
@@ -313,7 +324,7 @@ void loop() {
             }
 
             // 传感器 2 恢复背景底色 (芦笋尾部离开)
-            if (boundaryRecorded && s2.isBackground()) {
+            if (boundaryRecorded && s2.getType() == ColorType::BACKGROUND) {
                 Serial.println("[Head] Tail cleared sensor #2. Pausing conveyor to wait downstream IDLE.");
                 stepperConveyor.stop();
                 stateEntryTime = millis();
