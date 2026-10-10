@@ -11,16 +11,23 @@ description: Run compilation, build verification, and test suites across the wat
 
 ## 1. 常用验证命令 (按子工程)
 
-### A. ESP32 传感器与继电器固件 (`water_sensor_hx711` / `water_relay`)
+### A. ESP32 传感器与流水线固件 (`head` / `water_sensor_hx711` / `water_relay`)
 - **编译/语法检验**（无需连接硬件板卡）：
   ```powershell
+  # 验证 head 单元固件
+  pio run -d head
+
   # 验证传感器固件
   pio run -d water_sensor_hx711
 
   # 验证继电器网关固件
   pio run -d water_relay
   ```
-- **预期结果**：输出包含 `SUCCESS`，检查 RAM 与 Flash 占用率未溢出。
+- **固件烧录/下载**（当前规则已开启自动下载）：
+  ```powershell
+  pio run -d head -t upload
+  ```
+- **预期结果**：输出包含 `SUCCESS`，检查 RAM 与 Flash 占用率未溢出，烧录时输出 `Hash of data verified` 与 `Hard resetting via RTS pin`。
 
 ### B. Android 客户端 (`water_android`)
 - **Kotlin 编译校验**：

@@ -18,6 +18,9 @@
 ### 2.1 主控
 - **MCU**: ESP32-WROOM-32 开发板 (ESP32-DevKitC 通用款，无 PSRAM；双核 240MHz，双硬件 I2C)
 
+> [!TIP]
+> 原型测试与实物实验阶段若采用现成的 **YoraHome ESP32 (Gerber 1.3A)** 32 位三轴主板，其详细硬件架构、完整 GPIO 定义及免改板复用连线方案，请参阅专题文档：[《09 - YoraHome ESP32 (Gerber 1.3A) 现成三轴主板硬件架构、引脚定义 (GPIO) 与 head 单元测试适配全景剖析》](wiki/09_yorahome_esp32_gerber_1.3a_pinout_and_integration.md)。
+
 ### 2.2 传感器系统
 1. **双 TCS34725 颜色传感器 (安装在入口流水线上，相距固定距离 $D$)**:
    - **传感器 1 (前哨预警)**: 接入硬件 `I2C_0`。负责物料放入触发启动，以及检测到白根进入时提前通知电机降速；

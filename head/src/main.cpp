@@ -175,6 +175,48 @@ void performYMeasure() {
 // ==================== 初始化 ====================
 void setup() {
     Serial.begin(115200);
+
+#if STEPPER_TEST_ONLY
+    delay(500);
+    Serial.println("\n========================================================");
+    Serial.println("  Thin_Wall [Head Unit] - X 轴步进电机单向连续运转测试");
+    Serial.println("  硬件载体: YoraHome ESP32 (Gerber 1.3A)");
+    Serial.printf("  X_STEP 引脚: GPIO %d,  X_DIR 引脚: GPIO %d\n", CONVEYOR_STEP_PIN, CONVEYOR_DIR_PIN);
+    Serial.printf("  全局使能引脚: GPIO %d (低电平使能)\n", CONVEYOR_EN_PIN);
+    Serial.printf("  当前传动当量: %.3f steps/mm (5M 18T 同步轮)\n", STEPS_PER_MM_CONVEYOR);
+    Serial.println("========================================================");
+
+    // 状态指示灯与全局使能
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    digitalWrite(STATUS_LED_PIN, LOW);
+
+    pinMode(CONVEYOR_EN_PIN, OUTPUT);
+    digitalWrite(CONVEYOR_EN_PIN, LOW); // 低电平使能 A4988 步进驱动
+
+    // 输送电机平滑连续运行参数配置 (500 steps/s^2 平滑加速，约 2 秒升至巡航速度)
+    stepperConveyor.setMaxSpeed(1000.0f);     // 稳定巡航速度 steps/s (~28.1 mm/s)
+    stepperConveyor.setAcceleration(500.0f);  // 加速度 steps/s^2 (平滑启动防失步)
+    stepperConveyor.setCurrentPosition(0);
+
+    // 开机延时 3 秒倒计时
+    Serial.println("[开机延时] 等待 3 秒后启动单向连续运转...");
+    for (int i = 3; i > 0; i--) {
+        Serial.printf("[倒计时] %d ...\n", i);
+        digitalWrite(STATUS_LED_PIN, HIGH);
+        delay(500);
+        digitalWrite(STATUS_LED_PIN, LOW);
+        delay(500);
+    }
+    digitalWrite(STATUS_LED_PIN, HIGH); // 运行期间状态灯常亮
+
+    // 设置远端目标，启动连续单向运动
+    stepperConveyor.moveTo(2000000000L);
+
+    Serial.println("[Test Ready] 已启动单向连续运转！正在加速至巡航速度 (1000 steps/s)...");
+    Serial.println("[串口指令提示] 's'=暂停, 'r'=恢复连续运转, '+'=加速, '-'=减速, 'd'=切换旋转方向");
+    return;
+#endif
+
     Serial.println("\n--- Thin_Wall [Head Unit] Booting ---");
 
     // 数据串口 (UART2)
@@ -228,6 +270,70 @@ void setup() {
 
 // ==================== 主循环状态机 ====================
 void loop() {
+#if STEPPER_TEST_ONLY
+    static bool isRunning = true;
+    static float currentSpeed = 1000.0f;
+    static bool forwardDir = true;
+    static unsigned long lastLogTime = 0;
+
+    // 串口交互指令
+    if (Serial.available()) {
+        char cmd = (char)Serial.read();
+        if (cmd == 's' || cmd == 'S') {
+            isRunning = false;
+            stepperConveyor.stop();
+            digitalWrite(STATUS_LED_PIN, LOW);
+            Serial.println("[Cmd] 电机已暂停减速停机。发送 'r' 恢复运转。");
+        } else if (cmd == 'r' || cmd == 'R') {
+            isRunning = true;
+            digitalWrite(STATUS_LED_PIN, HIGH);
+            stepperConveyor.setMaxSpeed(currentSpeed);
+            long target = forwardDir ? 2000000000L : -2000000000L;
+            stepperConveyor.moveTo(target);
+            Serial.printf("[Cmd] 恢复单向连续运转，目标速度: %.0f steps/s (%.1f mm/s)\n",
+                          currentSpeed, currentSpeed / STEPS_PER_MM_CONVEYOR);
+        } else if (cmd == '+' || cmd == '=') {
+            currentSpeed += 200.0f;
+            if (currentSpeed > 4000.0f) currentSpeed = 4000.0f;
+            stepperConveyor.setMaxSpeed(currentSpeed);
+            Serial.printf("[Cmd] 加速 -> 设定速度: %.0f steps/s (%.1f mm/s)\n",
+                          currentSpeed, currentSpeed / STEPS_PER_MM_CONVEYOR);
+        } else if (cmd == '-' || cmd == '_') {
+            currentSpeed -= 200.0f;
+            if (currentSpeed < 200.0f) currentSpeed = 200.0f;
+            stepperConveyor.setMaxSpeed(currentSpeed);
+            Serial.printf("[Cmd] 减速 -> 设定速度: %.0f steps/s (%.1f mm/s)\n",
+                          currentSpeed, currentSpeed / STEPS_PER_MM_CONVEYOR);
+        } else if (cmd == 'd' || cmd == 'D') {
+            forwardDir = !forwardDir;
+            long target = forwardDir ? 2000000000L : -2000000000L;
+            stepperConveyor.moveTo(target);
+            Serial.printf("[Cmd] 切换方向 -> 当前方向: %s\n", forwardDir ? "正向 (+)" : "反向 (-)");
+        }
+    }
+
+    if (isRunning) {
+        // 确保距离目标始终充裕，绝不减速停步
+        if (abs(stepperConveyor.distanceToGo()) < 1000000L) {
+            long target = forwardDir ? (stepperConveyor.currentPosition() + 2000000000L)
+                                     : (stepperConveyor.currentPosition() - 2000000000L);
+            stepperConveyor.moveTo(target);
+        }
+
+        // 每隔 5 秒在串口打印一次运行状态（步数与毫米数），方便观察
+        if (millis() - lastLogTime >= 5000) {
+            lastLogTime = millis();
+            long pos = stepperConveyor.currentPosition();
+            float mm = (float)pos / STEPS_PER_MM_CONVEYOR;
+            Serial.printf("[Running] 运行中: 累计位移 = %ld 步 (约 %.1f mm), 实际转速 = %.0f steps/s\n",
+                          pos, mm, stepperConveyor.speed());
+        }
+    }
+
+    stepperConveyor.run();
+    return;
+#endif
+
     pollDownstreamHeartbeat();
 
     // 基础防空转位移保护
