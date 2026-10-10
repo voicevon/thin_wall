@@ -193,9 +193,9 @@ void setup() {
     pinMode(CONVEYOR_EN_PIN, OUTPUT);
     digitalWrite(CONVEYOR_EN_PIN, LOW); // 低电平使能 A4988 步进驱动
 
-    // 输送电机平滑连续运行参数配置 (500 steps/s^2 平滑加速，约 2 秒升至巡航速度)
-    stepperConveyor.setMaxSpeed(1000.0f);     // 稳定巡航速度 steps/s (~28.1 mm/s)
-    stepperConveyor.setAcceleration(500.0f);  // 加速度 steps/s^2 (平滑启动防失步)
+    // 输送电机平滑连续运行参数配置 (提速 10 倍: 10000 steps/s, 加速度 3000 steps/s^2)
+    stepperConveyor.setMaxSpeed(10000.0f);    // 稳定巡航速度 steps/s (~281.3 mm/s, 提升 10 倍)
+    stepperConveyor.setAcceleration(3000.0f); // 加速度 steps/s^2 (约 3.3 秒平滑升至最高速，防止起步失步)
     stepperConveyor.setCurrentPosition(0);
 
     // 开机延时 3 秒倒计时
@@ -212,7 +212,7 @@ void setup() {
     // 设置远端目标，启动连续单向运动
     stepperConveyor.moveTo(2000000000L);
 
-    Serial.println("[Test Ready] 已启动单向连续运转！正在加速至巡航速度 (1000 steps/s)...");
+    Serial.println("[Test Ready] 已启动单向连续运转！正在加速至巡航速度 (10000 steps/s)...");
     Serial.println("[串口指令提示] 's'=暂停, 'r'=恢复连续运转, '+'=加速, '-'=减速, 'd'=切换旋转方向");
     return;
 #endif
@@ -272,7 +272,7 @@ void setup() {
 void loop() {
 #if STEPPER_TEST_ONLY
     static bool isRunning = true;
-    static float currentSpeed = 1000.0f;
+    static float currentSpeed = 10000.0f;
     static bool forwardDir = true;
     static unsigned long lastLogTime = 0;
 
@@ -293,14 +293,14 @@ void loop() {
             Serial.printf("[Cmd] 恢复单向连续运转，目标速度: %.0f steps/s (%.1f mm/s)\n",
                           currentSpeed, currentSpeed / STEPS_PER_MM_CONVEYOR);
         } else if (cmd == '+' || cmd == '=') {
-            currentSpeed += 200.0f;
-            if (currentSpeed > 4000.0f) currentSpeed = 4000.0f;
+            currentSpeed += 1000.0f;
+            if (currentSpeed > 20000.0f) currentSpeed = 20000.0f;
             stepperConveyor.setMaxSpeed(currentSpeed);
             Serial.printf("[Cmd] 加速 -> 设定速度: %.0f steps/s (%.1f mm/s)\n",
                           currentSpeed, currentSpeed / STEPS_PER_MM_CONVEYOR);
         } else if (cmd == '-' || cmd == '_') {
-            currentSpeed -= 200.0f;
-            if (currentSpeed < 200.0f) currentSpeed = 200.0f;
+            currentSpeed -= 1000.0f;
+            if (currentSpeed < 500.0f) currentSpeed = 500.0f;
             stepperConveyor.setMaxSpeed(currentSpeed);
             Serial.printf("[Cmd] 减速 -> 设定速度: %.0f steps/s (%.1f mm/s)\n",
                           currentSpeed, currentSpeed / STEPS_PER_MM_CONVEYOR);

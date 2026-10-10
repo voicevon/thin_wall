@@ -101,8 +101,8 @@
 #define MAX_TRAVEL_MM           600.0f  // 单次最大安全位移 (mm)
 
 // 速度配置 (步进驱动转换)
-#define CONVEYOR_SPEED_HIGH_MMPS    100.0f // 高速推进速度 (mm/s)
-#define CONVEYOR_SPEED_LOW_MMPS     25.0f  // 低速高精测长速度 (mm/s)
+#define CONVEYOR_SPEED_HIGH_MMPS    1000.0f // 高速推进速度 (mm/s)
+#define CONVEYOR_SPEED_LOW_MMPS     250.0f  // 低速高精测长速度 (mm/s)
 #define CONVEYOR_ACCEL_MMPS2        500.0f // 加减速度 (mm/s^2)
 
 #define Y_SCAN_SPEED_MMPS           40.0f  // Y 轴扫径速度 (mm/s)
