@@ -30,7 +30,8 @@ head ──> body_1 ──> body_2 ──> ... ──> body_N（兜底）
 - **定位方式**: 本节用自身步进电机累计步数精确控制分流点位移与下游交接位移。
 
 ### 2.3 入口光电传感器
-- 安装在本节传送带的**入口**处，芦笋头部到达时输出遮挡信号，作为物料进入本节物理坐标的原点。
+- 安装在本节传送带的**入口**处，芦笋头部到达时输出遮挡信号，作为物料进入本节物理坐标的原点；
+- **传感器选型与物理论证**：由于芦笋直径跨度大（$\phi 6\sim 28\text{mm}$），常规单点激光/红外对射在细笋上易脱靶。详见系统选型论证报告：[《01 - 选型综合论证指南》](wiki/01_entry_sensor_selection_and_analysis.md)、商业落地指南：[《02 - 扁平阵列光纤传感器选型指南》](wiki/02_flat_ribbon_fiber_sensor_guide.md)、自制光幕方案剖析：[《03 - 自制红外光幕方案深度剖析》](wiki/03_diy_infrared_light_curtain_design.md)、自研对射落地规范：[《04 - 单发多收窄角对射光幕深化设计》](wiki/04_single_tx_multi_rx_light_curtain_design.md) 以及自研单侧反射规范：[《05 - 同侧漫反射式红外光幕工程深化设计》](wiki/05_colocated_reflective_infrared_curtain_design.md)。
 
 ### 2.4 分流执行器（通用接口，型号待定）
 - 位于入口光电传感器下游 `DIVERTER_OFFSET_MM` 处；

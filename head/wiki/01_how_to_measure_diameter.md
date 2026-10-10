@@ -2,7 +2,7 @@
 
 **文档编号**: WIKI-HEAD-01  
 **项目分支**: `head` (ESP32 芦笋测长测径单元)  
-**关联文档**: [06 - 彩色线阵 CCD 测长测径一体化方案探讨](06_color_linear_ccd_dual_measurement.md) | [07 - 全局快门面阵相机纯软件测量方案](07_global_shutter_area_camera_software_scheme.md) | [02 - 机器视觉光学基础与镜头选型](../../ccd_eye/wiki/02_optical_concepts_guide.md) | [04 - 方案二工程深化设计](../../ccd_eye/wiki/04_scheme2_linear_ccd_detailed_design.md) | [05 - 线阵 CCD 接口与采集协处理器](../../ccd_eye/wiki/05_linear_ccd_interface_board.md)  
+**关联文档**: [06 - 彩色线阵 CCD 测长测径一体化方案探讨](06_color_linear_ccd_dual_measurement.md) | [07 - 全局快门面阵相机纯软件测量方案](07_global_shutter_area_camera_software_scheme.md) | [08 - APDS-9960 接近检测分析](08_apds9960_proximity_detection_analysis.md) | [02 - 机器视觉光学基础与镜头选型](../../ccd_eye/wiki/02_optical_concepts_guide.md) | [04 - 方案二工程深化设计](../../ccd_eye/wiki/04_scheme2_linear_ccd_detailed_design.md) | [05 - 线阵 CCD 接口与采集协处理器](../../ccd_eye/wiki/05_linear_ccd_interface_board.md)  
 **作者/架构**: thin_wall 工程组  
 **状态**: 系统级技术方案选型评审报告 (Master Evaluation Paper / RFC)  
 **创建时间**: 2026-10-10  
