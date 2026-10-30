@@ -1,59 +1,55 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <AccelStepper.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
 #include "config.h"
 #include "protocol.h"
+#include "web_page.h"
+
+// ==================== Web & WebSocket 实例 ====================
+static WebServer server(WEB_SERVER_PORT);
+static WebSocketsServer webSocket(WS_SERVER_PORT);
 
 // ==================== 全局外设与变量 ====================
-// 电机驱动实例 (使用 Step/Dir)
-AccelStepper stepperConveyor(AccelStepper::DRIVER, CONVEYOR_STEP_PIN, CONVEYOR_DIR_PIN);
-AccelStepper stepperY(AccelStepper::DRIVER, Y_STEP_PIN, Y_DIR_PIN);
-
-// 颜色传感器实例
-Adafruit_TCS34725 tcs1 = Adafruit_TCS34725(TCS_INTEGRATION_TIME, TCS_GAIN);
-Adafruit_TCS34725 tcs2 = Adafruit_TCS34725(TCS_INTEGRATION_TIME, TCS_GAIN);
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS_INTEGRATION_TIME, TCS_GAIN);
 
 // 状态机枚举
-// 核心状态机枚举 (Head 测量火车头工作状态)
 enum HeadState {
-    STATE_Y_HOMING = 0,     // Y 轴测径电机回零归位 (上电复位)
-    STATE_IDLE,             // 待机空闲：输送静止，等待放入芦笋
-    STATE_FAST_ADV,         // 高速推进：传感器 1 侦测到进料，输送电机高速向前推进
-    STATE_SLOW_SCAN,        // 低速精测：传感器 1 预警白根，平滑降速供传感器 2 高精捕捉分界点
-    STATE_Y_MEASURE,        // 激光扫径：到达测径工位，输送电机短暂停机，Y 轴横向扫描测外径
-    STATE_WAIT_DOWNSTREAM,  // 等待后机空闲：测长完成，输送电机原地暂停，等待下游车厢报告 IDLE
-    STATE_EJECT,            // 出料交接：下游空闲，发送测量 JSON 数据并推进固定位移交接芦笋
-    STATE_FAULT             // 故障保护：防空转超程或传感器采样异常，停机告警并等待复位
+    STATE_IDLE = 0,             // 待机空闲：电机停机，补光常亮，检测芦笋放入
+    STATE_TRANSPORT_INSPECT,    // 推进识别：电机前进输送，持续采集颜色判定，直到尾部离开
+    STATE_WAIT_DOWNSTREAM,      // 原地等待：尾部离开后电机暂停，监听等待下游车厢 IDLE
+    STATE_HANDOFF,              // 交接推进：向下游发送数据包，并启动电机推料送入下游车厢
+    STATE_FAULT                 // 故障保护：防卡料超时或传感器故障，停机告警
 };
 
-HeadState currentState = STATE_Y_HOMING;
-HeadState resumeStateAfterMeasure = STATE_FAST_ADV;
-
-// 测量过程数据
-static uint32_t currentItemId = 1000;
-static long stepP0 = 0;              // 绿头起点步数
-static bool p0Recorded = false;
-static long stepBoundary = 0;        // 绿白分界步数
-static bool boundaryRecorded = false;
-static bool diamMeasured = false;
-static float measuredGreenLength = 0.0f;
-static float measuredDiameter = 0.0f;
-static long ejectTargetStep = 0;
+static HeadState currentState = STATE_IDLE;
 static unsigned long stateEntryTime = 0;
 
-// 下游心跳与通信
+// 物料检测与数据记录
+static uint32_t currentItemId = 1000;
+static uint32_t greenSampleCount = 0;
+static uint32_t whiteSampleCount = 0;
+static uint32_t totalObjectSampleCount = 0;
+static bool sensorOnline = false;
+static bool ledState = true; // 补光 LED 状态 (开机默认开启)
+
+// 滤波连续计数器
+static uint8_t objectDetectCounter = 0;
+static uint8_t objectLeaveCounter = 0;
+
+// 下游心跳与串口通信
 static NodeState downstreamState = NodeState::UNKNOWN;
 static unsigned long lastDownstreamHeartbeatTime = 0;
 static char serial2RxBuf[128];
 static size_t serial2RxIdx = 0;
 
-// ==================== 辅助传感器函数 ====================
-// 颜色类别互斥枚举
+// ==================== 颜色结构与读取 ====================
 enum class ColorType {
-    BACKGROUND = 0, // 背景底色 / 空载 (无物料)
+    BACKGROUND = 0, // 背景底色 / 空载
     GREEN,          // 绿色嫩茎
     WHITE,          // 白根
-    TRANSITION      // 绿白过渡区 / 未定 (落在 GREEN 与 WHITE 阈值之间)
+    TRANSITION      // 过渡区
 };
 
 struct ColorSample {
@@ -77,19 +73,167 @@ struct ColorSample {
     }
 };
 
-ColorSample readSensor1() {
-    ColorSample s;
-    tcs1.getRawData(&s.r, &s.g, &s.b, &s.c);
+ColorSample readColorSensor() {
+    ColorSample s = {0, 0, 0, 0};
+    if (sensorOnline) {
+        tcs.getRawData(&s.r, &s.g, &s.b, &s.c);
+    }
     return s;
 }
 
-ColorSample readSensor2() {
-    ColorSample s;
-    tcs2.getRawData(&s.r, &s.g, &s.b, &s.c);
-    return s;
+// ==================== 板载按键控制 (GPIO 0 BOOT) ====================
+void handleButton() {
+    static int lastBtnReading = HIGH;
+    static unsigned long lastDebounceTime = 0;
+    static bool buttonPressed = false;
+
+    int reading = digitalRead(BUTTON_PIN);
+    if (reading != lastBtnReading) {
+        lastDebounceTime = millis();
+        lastBtnReading = reading;
+    }
+
+    if ((millis() - lastDebounceTime) > 35) {
+        if (reading == LOW && !buttonPressed) {
+            buttonPressed = true;
+            ledState = !ledState;
+            digitalWrite(LED_CTRL_PIN, ledState ? HIGH : LOW);
+            Serial.printf("[BUTTON] GPIO0 Pressed -> LED %s\n", ledState ? "ON" : "OFF");
+        } else if (reading == HIGH && buttonPressed) {
+            buttonPressed = false;
+        }
+    }
 }
 
-// ==================== 下游串口心跳处理 ====================
+// ==================== RGB 转 HSV 算法 (OpenCV 8-bit 规范) ====================
+// H: 0 ~ 180 (标准色相角 0~360 除以 2)
+// S: 0 ~ 255 (饱和度归一化至单字节 0~255)
+// V: 0 ~ 255 (明度归一化至单字节 0~255)
+struct HsvColorOpenCV {
+    uint8_t h; // 0 ~ 180
+    uint8_t s; // 0 ~ 255
+    uint8_t v; // 0 ~ 255
+};
+
+HsvColorOpenCV rgbToHsvOpenCV(uint16_t r, uint16_t g, uint16_t b, uint16_t c) {
+    HsvColorOpenCV hsv = {0, 0, 0};
+    float rf = (float)r;
+    float gf = (float)g;
+    float bf = (float)b;
+
+    float rawMax = max(rf, max(gf, bf));
+    // 采用自适应防溢出缩放：当未达到 255 时保持真实光强 scale=1.0；超过 255 时等比缩放
+    float scale = (rawMax > 255.0f) ? (255.0f / rawMax) : 1.0f;
+    rf *= scale;
+    gf *= scale;
+    bf *= scale;
+
+    float maxVal = max(rf, max(gf, bf));
+    float minVal = min(rf, min(gf, bf));
+    float delta = maxVal - minVal;
+
+    // 明度 V: 真实反映绝对强度 (0 ~ 255)
+    hsv.v = (uint8_t)constrain((int)roundf(maxVal), 0, 255);
+
+    // 若无色差或全黑
+    if (maxVal <= 0.0f || delta <= 0.0f) {
+        hsv.s = 0;
+        hsv.h = 0;
+        return hsv;
+    }
+
+    // 饱和度 S: 0 ~ 255
+    float sNorm = (delta / maxVal) * 255.0f;
+    hsv.s = (uint8_t)constrain((int)roundf(sNorm), 0, 255);
+
+    // 色相 H: 0 ~ 180 (OpenCV 规范)
+    float hDeg = 0.0f;
+    if (rf >= maxVal) {
+        hDeg = 60.0f * fmodf(((gf - bf) / delta), 6.0f);
+    } else if (gf >= maxVal) {
+        hDeg = 60.0f * (((bf - rf) / delta) + 2.0f);
+    } else {
+        hDeg = 60.0f * (((rf - gf) / delta) + 4.0f);
+    }
+
+    if (hDeg < 0.0f) {
+        hDeg += 360.0f;
+    }
+
+    float hOpenCV = hDeg / 2.0f;
+    hsv.h = (uint8_t)constrain((int)roundf(hOpenCV), 0, 180);
+
+    return hsv;
+}
+
+// ==================== 5Hz (200ms) 采样推流与串口打印 ====================
+void handlePeriodicPublish(const ColorSample& s) {
+    static unsigned long lastPubTime = 0;
+    unsigned long now = millis();
+    if (now - lastPubTime >= SAMPLE_INTERVAL_MS) {
+        lastPubTime = now;
+        HsvColorOpenCV hsv = rgbToHsvOpenCV(s.r, s.g, s.b, s.c);
+
+        // 1. 串口打印 (OpenCV 8-bit HSV 规范)
+        Serial.printf("[COLOR] RGB:[%5u, %5u, %5u] | HSV:[%3u, %3u, %3u] | Clear:%5u\n",
+                      s.r, s.g, s.b, hsv.h, hsv.s, hsv.v, s.c);
+
+        // 2. WebSocket 广播 JSON 数据包至已连接的浏览器客户端
+        if (webSocket.connectedClients() > 0) {
+            char jsonBuf[128];
+            snprintf(jsonBuf, sizeof(jsonBuf),
+                     "{\"r\":%u,\"g\":%u,\"b\":%u,\"c\":%u,\"h\":%u,\"s\":%u,\"v\":%u,\"led\":%d}",
+                     s.r, s.g, s.b, s.c, hsv.h, hsv.s, hsv.v, ledState ? 1 : 0);
+            webSocket.broadcastTXT(jsonBuf);
+        }
+    }
+}
+
+// ==================== 直流电机驱动 ====================
+void motorInit() {
+    ledcSetup(MOTOR_PWM_CH_IN1, MOTOR_PWM_FREQ, MOTOR_PWM_RES_BITS);
+    ledcSetup(MOTOR_PWM_CH_IN2, MOTOR_PWM_FREQ, MOTOR_PWM_RES_BITS);
+    ledcAttachPin(MOTOR_IN1_PIN, MOTOR_PWM_CH_IN1);
+    ledcAttachPin(MOTOR_IN2_PIN, MOTOR_PWM_CH_IN2);
+    ledcWrite(MOTOR_PWM_CH_IN1, 0);
+    ledcWrite(MOTOR_PWM_CH_IN2, 0);
+}
+
+void motorForward(uint8_t speed) {
+    ledcWrite(MOTOR_PWM_CH_IN1, speed);
+    ledcWrite(MOTOR_PWM_CH_IN2, 0);
+}
+
+void motorStop() {
+    ledcWrite(MOTOR_PWM_CH_IN1, 0);
+    ledcWrite(MOTOR_PWM_CH_IN2, 0);
+}
+
+void motorBrake() {
+    ledcWrite(MOTOR_PWM_CH_IN1, 255);
+    ledcWrite(MOTOR_PWM_CH_IN2, 255);
+}
+
+// ==================== 状态切换辅助函数 ====================
+const char* stateToString(HeadState st) {
+    switch (st) {
+        case STATE_IDLE:                return "IDLE";
+        case STATE_TRANSPORT_INSPECT:   return "TRANSPORT_INSPECT";
+        case STATE_WAIT_DOWNSTREAM:     return "WAIT_DOWNSTREAM";
+        case STATE_HANDOFF:             return "HANDOFF";
+        case STATE_FAULT:               return "FAULT";
+        default:                        return "UNKNOWN";
+    }
+}
+
+void switchState(HeadState next) {
+    if (currentState == next) return;
+    Serial.printf("[HEAD] State: %s -> %s\n", stateToString(currentState), stateToString(next));
+    currentState = next;
+    stateEntryTime = millis();
+}
+
+// ==================== 下游串口心跳与数据通信 ====================
 void pollDownstreamHeartbeat() {
     while (Serial2.available()) {
         char ch = (char)Serial2.read();
@@ -103,8 +247,10 @@ void pollDownstreamHeartbeat() {
                 }
                 serial2RxIdx = 0;
             }
-        } else if (serial2RxIdx + 1 < sizeof(serial2RxBuf)) {
-            serial2RxBuf[serial2RxIdx++] = ch;
+        } else {
+            if (serial2RxIdx < sizeof(serial2RxBuf) - 1) {
+                serial2RxBuf[serial2RxIdx++] = ch;
+            }
         }
     }
 
@@ -113,397 +259,286 @@ void pollDownstreamHeartbeat() {
     }
 }
 
-// ==================== Y 轴归零与测径 ====================
-void homeYAxis() {
-    Serial.println("[Head] Y-Axis Homing started...");
-    stepperY.setMaxSpeed(Y_HOMING_SPEED_MMPS * STEPS_PER_MM_Y);
-    stepperY.setAcceleration(Y_HOMING_SPEED_MMPS * STEPS_PER_MM_Y * 4.0f);
-    
-    // 向限位方向缓慢移动
-    stepperY.setSpeed(-Y_HOMING_SPEED_MMPS * STEPS_PER_MM_Y);
-    unsigned long startHoming = millis();
-    while (digitalRead(Y_LIMIT_PIN) != LOW) {
-        stepperY.runSpeed();
-        if (millis() - startHoming > 10000) {
-            Serial.println("[Head] ERROR: Y-Axis Homing Timeout!");
-            currentState = STATE_FAULT;
-            return;
-        }
-    }
-    stepperY.setCurrentPosition(0);
-    // 稍微向正方向退离限位
-    stepperY.runToNewPosition((long)(2.0f * STEPS_PER_MM_Y));
-    stepperY.setCurrentPosition(0);
-    Serial.println("[Head] Y-Axis Homing Complete.");
-}
+void sendMeasureReport(const char* statusStr) {
+    MeasureReport report;
+    report.item_id = ++currentItemId;
+    report.green_length_mm = 0.0f;
+    report.diameter_mm = 0.0f;
+    strncpy(report.status, statusStr, sizeof(report.status) - 1);
+    report.status[sizeof(report.status) - 1] = '\0';
 
-void performYMeasure() {
-    Serial.println("[Head] Performing Y-Axis Laser Diameter Scan...");
-    stepperY.setMaxSpeed(Y_SCAN_SPEED_MMPS * STEPS_PER_MM_Y);
-    stepperY.setAcceleration(Y_SCAN_SPEED_MMPS * STEPS_PER_MM_Y * 4.0f);
-
-    long maxScanSteps = (long)(Y_MAX_TRAVEL_MM * STEPS_PER_MM_Y);
-    long stepLaserStart = -1;
-    long stepLaserEnd = -1;
-
-    stepperY.moveTo(maxScanSteps);
-    while (stepperY.distanceToGo() > 0) {
-        stepperY.run();
-        bool blocked = (digitalRead(DIAM_LASER_PIN) == LOW); // 假设遮挡为低电平
-        if (blocked) {
-            if (stepLaserStart < 0) stepLaserStart = stepperY.currentPosition();
-            stepLaserEnd = stepperY.currentPosition();
-        }
-    }
-
-    if (stepLaserStart >= 0 && stepLaserEnd >= stepLaserStart) {
-        float rawSteps = (float)(stepLaserEnd - stepLaserStart);
-        float rawWidth = rawSteps / STEPS_PER_MM_Y;
-        measuredDiameter = rawWidth - LASER_SPOT_MM;
-        if (measuredDiameter < 0.0f) measuredDiameter = 0.0f;
-        Serial.printf("[Head] Diameter Scan Success: %.2f mm\n", measuredDiameter);
+    char txBuf[160];
+    if (report.serialize(txBuf, sizeof(txBuf))) {
+        Serial2.print(txBuf);
+        Serial.printf("[TX->BODY] Sent Report: %s", txBuf);
     } else {
-        measuredDiameter = 0.0f;
-        Serial.println("[Head] Diameter Scan: No object blocked the laser beam.");
+        Serial.println("[HEAD] Error: Report serialize failed!");
     }
-    diamMeasured = true;
-
-    // 回零
-    stepperY.runToNewPosition(0);
 }
 
-// ==================== 初始化 ====================
+// ==================== 串口调试指令交互 ====================
+void handleDebugConsole() {
+    while (Serial.available()) {
+        char cmd = (char)Serial.read();
+        if (cmd == '\r' || cmd == '\n' || cmd == ' ') continue;
+
+        switch (cmd) {
+            case 'f':
+                Serial.println("[CMD] Motor Forward Test (2000ms)...");
+                motorForward(MOTOR_SPEED_DEFAULT);
+                delay(2000);
+                motorStop();
+                Serial.println("[CMD] Motor Stopped.");
+                break;
+            case 's':
+                motorStop();
+                Serial.println("[CMD] Motor Stopped.");
+                break;
+            case 'c': {
+                ColorSample s = readColorSensor();
+                float total = (float)(s.r + s.g + s.b);
+                float gRatio = (total > 0.0f) ? (float)s.g / total : 0.0f;
+                Serial.printf("[CMD] Sensor R:%u G:%u B:%u Clear:%u | gRatio:%.3f (Type:%d)\n",
+                              s.r, s.g, s.b, s.c, gRatio, (int)s.getType());
+                break;
+            }
+            case 'r':
+                Serial.println("[CMD] Reset State to IDLE.");
+                motorStop();
+                switchState(STATE_IDLE);
+                break;
+            case '?':
+                Serial.println("--- Debug Commands ---");
+                Serial.println(" f : Test motor forward 2s");
+                Serial.println(" s : Stop motor");
+                Serial.println(" c : Read TCS34725 sample");
+                Serial.println(" r : Force reset state to IDLE");
+                Serial.println("----------------------");
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+// ==================== WebSocket 事件处理 ====================
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    if (type == WStype_CONNECTED) {
+        IPAddress ip = webSocket.remoteIP(num);
+        Serial.printf("[WS] Client #%u connected from %s\n", num, ip.toString().c_str());
+    } else if (type == WStype_DISCONNECTED) {
+        Serial.printf("[WS] Client #%u disconnected\n", num);
+    } else if (type == WStype_TEXT) {
+        String msg = String((char*)payload);
+        if (msg.indexOf("TOGGLE_LED") >= 0) {
+            ledState = !ledState;
+            digitalWrite(LED_CTRL_PIN, ledState ? HIGH : LOW);
+            Serial.printf("[WS] Toggle LED via Web -> %s\n", ledState ? "ON" : "OFF");
+        } else if (msg.indexOf("SET_GAIN_") >= 0) {
+            if (msg.indexOf("1X") >= 0) {
+                tcs.setGain(TCS34725_GAIN_1X);
+                Serial.println("[TCS] Gain switched to 1X");
+            } else if (msg.indexOf("4X") >= 0) {
+                tcs.setGain(TCS34725_GAIN_4X);
+                Serial.println("[TCS] Gain switched to 4X");
+            } else if (msg.indexOf("16X") >= 0) {
+                tcs.setGain(TCS34725_GAIN_16X);
+                Serial.println("[TCS] Gain switched to 16X (+4x Sensitivity)");
+            } else if (msg.indexOf("60X") >= 0) {
+                tcs.setGain(TCS34725_GAIN_60X);
+                Serial.println("[TCS] Gain switched to 60X (Max)");
+            }
+        }
+    }
+}
+
+// ==================== WiFi & Web 服务器启动 ====================
+void setupNetwork() {
+    Serial.printf("[WiFi] Connecting to '%s' ...\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    unsigned long startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startMs < 10000)) {
+        delay(400);
+        Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("=================================================");
+        Serial.printf(" [WiFi] Connected! IP Address: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf(" [WEB] Open in Browser: http://%s\n", WiFi.localIP().toString().c_str());
+        Serial.println("=================================================");
+    } else {
+        Serial.println("[WiFi] Connection timeout. ESP32 will keep trying in background.");
+    }
+
+    server.on("/", HTTP_GET, []() {
+        server.send_P(200, "text/html", PAGE_INDEX_HTML);
+    });
+    server.begin();
+    webSocket.begin();
+    webSocket.onEvent(onWebSocketEvent);
+}
+
+// ==================== 主设置 setup ====================
 void setup() {
     Serial.begin(115200);
+    delay(200);
+    Serial.println("\n=============================================");
+    Serial.println("  thin_wall - head (ESP32 DC Motor + TCS34725)");
+    Serial.println("=============================================");
 
-#if STEPPER_TEST_ONLY
-    delay(500);
-    Serial.println("\n========================================================");
-    Serial.println("  Thin_Wall [Head Unit] - X 轴步进电机单向连续运转测试");
-    Serial.println("  硬件载体: YoraHome ESP32 (Gerber 1.3A)");
-    Serial.printf("  X_STEP 引脚: GPIO %d,  X_DIR 引脚: GPIO %d\n", CONVEYOR_STEP_PIN, CONVEYOR_DIR_PIN);
-    Serial.printf("  全局使能引脚: GPIO %d (低电平使能)\n", CONVEYOR_EN_PIN);
-    Serial.printf("  当前传动当量: %.3f steps/mm (5M 18T 同步轮)\n", STEPS_PER_MM_CONVEYOR);
-    Serial.println("========================================================");
-
-    // 状态指示灯与全局使能
-    pinMode(STATUS_LED_PIN, OUTPUT);
-    digitalWrite(STATUS_LED_PIN, LOW);
-
-    pinMode(CONVEYOR_EN_PIN, OUTPUT);
-    digitalWrite(CONVEYOR_EN_PIN, LOW); // 低电平使能 A4988 步进驱动
-
-    // 输送电机平滑连续运行参数配置 (提速 10 倍: 10000 steps/s, 加速度 3000 steps/s^2)
-    stepperConveyor.setMaxSpeed(10000.0f);    // 稳定巡航速度 steps/s (~281.3 mm/s, 提升 10 倍)
-    stepperConveyor.setAcceleration(3000.0f); // 加速度 steps/s^2 (约 3.3 秒平滑升至最高速，防止起步失步)
-    stepperConveyor.setCurrentPosition(0);
-
-    // 开机延时 3 秒倒计时
-    Serial.println("[开机延时] 等待 3 秒后启动单向连续运转...");
-    for (int i = 3; i > 0; i--) {
-        Serial.printf("[倒计时] %d ...\n", i);
-        digitalWrite(STATUS_LED_PIN, HIGH);
-        delay(500);
-        digitalWrite(STATUS_LED_PIN, LOW);
-        delay(500);
-    }
-    digitalWrite(STATUS_LED_PIN, HIGH); // 运行期间状态灯常亮
-
-    // 设置远端目标，启动连续单向运动
-    stepperConveyor.moveTo(2000000000L);
-
-    Serial.println("[Test Ready] 已启动单向连续运转！正在加速至巡航速度 (10000 steps/s)...");
-    Serial.println("[串口指令提示] 's'=暂停, 'r'=恢复连续运转, '+'=加速, '-'=减速, 'd'=切换旋转方向");
-    return;
-#endif
-
-    Serial.println("\n--- Thin_Wall [Head Unit] Booting ---");
-
-    // 数据串口 (UART2)
-    Serial2.begin(DATA_UART_BAUD, SERIAL_8N1, DATA_UART_RX_PIN, DATA_UART_TX_PIN);
-
-    // 引脚模式
-    pinMode(LED_CTRL_1_PIN, OUTPUT);
-    pinMode(LED_CTRL_2_PIN, OUTPUT);
-    pinMode(STATUS_LED_PIN, OUTPUT);
-    pinMode(Y_LIMIT_PIN, INPUT_PULLUP);
-    pinMode(DIAM_LASER_PIN, INPUT_PULLUP);
-
-    pinMode(CONVEYOR_EN_PIN, OUTPUT);
-    pinMode(Y_EN_PIN, OUTPUT);
-    digitalWrite(CONVEYOR_EN_PIN, LOW); // 低电平使能 A4988
-    digitalWrite(Y_EN_PIN, LOW);
-
-    // 补光灯开启并常亮
-    digitalWrite(LED_CTRL_1_PIN, HIGH);
-    digitalWrite(LED_CTRL_2_PIN, HIGH);
-    digitalWrite(STATUS_LED_PIN, HIGH);
+    // 1. 初始化按键与补光 LED
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(LED_CTRL_PIN, OUTPUT);
+    digitalWrite(LED_CTRL_PIN, ledState ? HIGH : LOW);
+    Serial.printf("[HEAD] LED Warmup (%d ms, State: %s)...\n", LED_WARMUP_MS, ledState ? "ON" : "OFF");
     delay(LED_WARMUP_MS);
 
-    // I2C 颜色传感器初始化
-    Wire.begin(I2C0_SDA_PIN, I2C0_SCL_PIN, 400000);
-    Wire1.begin(I2C1_SDA_PIN, I2C1_SCL_PIN, 400000);
-
-    if (tcs1.begin(TCS34725_ADDRESS, &Wire)) {
-        Serial.println("[Head] Sensor #1 (I2C0) initialized.");
+    // 2. 初始化 I2C 颜色传感器
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    if (tcs.begin(0x29, &Wire)) {
+        sensorOnline = true;
+        Serial.println("[HEAD] TCS34725 Color Sensor initialized successfully (0x29).");
     } else {
-        Serial.println("[Head] WARNING: Sensor #1 (I2C0) not detected!");
+        sensorOnline = false;
+        Serial.println("[HEAD] WARNING: TCS34725 not found on I2C bus!");
     }
 
-    if (tcs2.begin(TCS34725_ADDRESS, &Wire1)) {
-        Serial.println("[Head] Sensor #2 (I2C1) initialized.");
-    } else {
-        Serial.println("[Head] WARNING: Sensor #2 (I2C1) not detected!");
-    }
+    // 3. 初始化直流电机 H 桥
+    motorInit();
+    Serial.println("[HEAD] DC Motor PWM initialized.");
 
-    // 输送电机配置
-    stepperConveyor.setMaxSpeed(CONVEYOR_SPEED_HIGH_MMPS * STEPS_PER_MM_CONVEYOR);
-    stepperConveyor.setAcceleration(CONVEYOR_ACCEL_MMPS2 * STEPS_PER_MM_CONVEYOR);
+    // 4. 初始化下行数据串口
+    Serial2.begin(DATA_UART_BAUD, SERIAL_8N1, DATA_UART_RX_PIN, DATA_UART_TX_PIN);
+    Serial.printf("[HEAD] Data UART2 started (TX:%d, RX:%d, Baud:%d).\n",
+                  DATA_UART_TX_PIN, DATA_UART_RX_PIN, DATA_UART_BAUD);
 
-    // 执行上电回零
-    homeYAxis();
-    if (currentState != STATE_FAULT) {
-        currentState = STATE_IDLE;
-        Serial.println("[Head] State -> IDLE. Waiting for asparagus feed.");
-    }
+    // 5. 连接 WiFi 并启动 Web & WebSocket 服务
+    setupNetwork();
+
+    switchState(STATE_IDLE);
 }
 
-// ==================== 主循环状态机 ====================
+// ==================== 主循环 loop ====================
 void loop() {
-#if STEPPER_TEST_ONLY
-    static bool isRunning = true;
-    static float currentSpeed = 10000.0f;
-    static bool forwardDir = true;
-    static unsigned long lastLogTime = 0;
+    // 0. 网络与 Web 服务轮询
+    server.handleClient();
+    webSocket.loop();
 
-    // 串口交互指令
-    if (Serial.available()) {
-        char cmd = (char)Serial.read();
-        if (cmd == 's' || cmd == 'S') {
-            isRunning = false;
-            stepperConveyor.stop();
-            digitalWrite(STATUS_LED_PIN, LOW);
-            Serial.println("[Cmd] 电机已暂停减速停机。发送 'r' 恢复运转。");
-        } else if (cmd == 'r' || cmd == 'R') {
-            isRunning = true;
-            digitalWrite(STATUS_LED_PIN, HIGH);
-            stepperConveyor.setMaxSpeed(currentSpeed);
-            long target = forwardDir ? 2000000000L : -2000000000L;
-            stepperConveyor.moveTo(target);
-            Serial.printf("[Cmd] 恢复单向连续运转，目标速度: %.0f steps/s (%.1f mm/s)\n",
-                          currentSpeed, currentSpeed / STEPS_PER_MM_CONVEYOR);
-        } else if (cmd == '+' || cmd == '=') {
-            currentSpeed += 1000.0f;
-            if (currentSpeed > 20000.0f) currentSpeed = 20000.0f;
-            stepperConveyor.setMaxSpeed(currentSpeed);
-            Serial.printf("[Cmd] 加速 -> 设定速度: %.0f steps/s (%.1f mm/s)\n",
-                          currentSpeed, currentSpeed / STEPS_PER_MM_CONVEYOR);
-        } else if (cmd == '-' || cmd == '_') {
-            currentSpeed -= 1000.0f;
-            if (currentSpeed < 500.0f) currentSpeed = 500.0f;
-            stepperConveyor.setMaxSpeed(currentSpeed);
-            Serial.printf("[Cmd] 减速 -> 设定速度: %.0f steps/s (%.1f mm/s)\n",
-                          currentSpeed, currentSpeed / STEPS_PER_MM_CONVEYOR);
-        } else if (cmd == 'd' || cmd == 'D') {
-            forwardDir = !forwardDir;
-            long target = forwardDir ? 2000000000L : -2000000000L;
-            stepperConveyor.moveTo(target);
-            Serial.printf("[Cmd] 切换方向 -> 当前方向: %s\n", forwardDir ? "正向 (+)" : "反向 (-)");
-        }
-    }
+    // 1. 按键控制补光 LED (GPIO 0 单击翻转)
+    handleButton();
 
-    if (isRunning) {
-        // 确保距离目标始终充裕，绝不减速停步
-        if (abs(stepperConveyor.distanceToGo()) < 1000000L) {
-            long target = forwardDir ? (stepperConveyor.currentPosition() + 2000000000L)
-                                     : (stepperConveyor.currentPosition() - 2000000000L);
-            stepperConveyor.moveTo(target);
-        }
-
-        // 每隔 5 秒在串口打印一次运行状态（步数与毫米数），方便观察
-        if (millis() - lastLogTime >= 5000) {
-            lastLogTime = millis();
-            long pos = stepperConveyor.currentPosition();
-            float mm = (float)pos / STEPS_PER_MM_CONVEYOR;
-            Serial.printf("[Running] 运行中: 累计位移 = %ld 步 (约 %.1f mm), 实际转速 = %.0f steps/s\n",
-                          pos, mm, stepperConveyor.speed());
-        }
-    }
-
-    stepperConveyor.run();
-    return;
-#endif
-
+    // 2. 监听下游心跳与调试命令
     pollDownstreamHeartbeat();
+    handleDebugConsole();
 
-    // 基础防空转位移保护
-    if (currentState == STATE_FAST_ADV || currentState == STATE_SLOW_SCAN) {
-        if (stepperConveyor.currentPosition() > (long)(MAX_TRAVEL_MM * STEPS_PER_MM_CONVEYOR)) {
-            Serial.println("[Head] ERROR: Max travel exceeded without exit! Emergency STOP.");
-            stepperConveyor.stop();
-            currentState = STATE_FAULT;
-        }
-    }
+    // 3. 周期读取颜色传感器并通过 200ms 周期推流 (串口 + WebSocket)
+    ColorSample sample = readColorSensor();
+    handlePeriodicPublish(sample);
+
+    unsigned long now = millis();
 
     switch (currentState) {
-        case STATE_Y_HOMING:
-            homeYAxis();
-            if (currentState != STATE_FAULT) currentState = STATE_IDLE;
-            break;
-
         case STATE_IDLE: {
-            stepperConveyor.stop();
-            ColorSample s1 = readSensor1();
-            if (s1.getType() != ColorType::BACKGROUND) {
-                // 物料放入触发
-                Serial.println("[Head] Sensor #1 triggered! Starting high speed feed.");
-                stepperConveyor.setCurrentPosition(0);
-                stepperConveyor.setMaxSpeed(CONVEYOR_SPEED_HIGH_MMPS * STEPS_PER_MM_CONVEYOR);
-                stepperConveyor.setSpeed(CONVEYOR_SPEED_HIGH_MMPS * STEPS_PER_MM_CONVEYOR);
-                p0Recorded = false;
-                boundaryRecorded = false;
-                diamMeasured = false;
-                measuredGreenLength = 0.0f;
-                measuredDiameter = 0.0f;
-                currentState = STATE_FAST_ADV;
-            }
-            break;
-        }
-
-        case STATE_FAST_ADV: {
-            stepperConveyor.runSpeed();
-
-            // 传感器 2 捕捉绿头起点 P0
-            if (!p0Recorded) {
-                ColorSample s2 = readSensor2();
-                if (s2.getType() == ColorType::GREEN) {
-                    stepP0 = stepperConveyor.currentPosition();
-                    p0Recorded = true;
-                    Serial.printf("[Head] Green head detected at P0 = %ld steps\n", stepP0);
+            motorStop();
+            // 待机下检测物料放入 (Clear 超过空载背景阈值)
+            if (sample.getType() != ColorType::BACKGROUND) {
+                if (++objectDetectCounter >= COLOR_CONFIRM_SAMPLES) {
+                    objectDetectCounter = 0;
+                    objectLeaveCounter = 0;
+                    greenSampleCount = 0;
+                    whiteSampleCount = 0;
+                    totalObjectSampleCount = 0;
+                    Serial.println("[HEAD] Object detected! Starting feed motor...");
+                    motorForward(MOTOR_SPEED_DEFAULT);
+                    switchState(STATE_TRANSPORT_INSPECT);
                 }
-            }
-
-            // 检查测径工位到达
-            if (p0Recorded && !diamMeasured) {
-                long targetDiamSteps = stepP0 + (long)((LASER_OFFSET_MM + DIAM_POINT_MM) * STEPS_PER_MM_CONVEYOR);
-                if (stepperConveyor.currentPosition() >= targetDiamSteps) {
-                    resumeStateAfterMeasure = STATE_FAST_ADV;
-                    currentState = STATE_Y_MEASURE;
-                    break;
-                }
-            }
-
-            // 传感器 1 侦测白根预警 (前哨降速)
-            ColorSample s1 = readSensor1();
-            if (s1.getType() == ColorType::WHITE) {
-                Serial.println("[Head] Sensor #1 detected white root! Slowing down...");
-                stepperConveyor.setMaxSpeed(CONVEYOR_SPEED_LOW_MMPS * STEPS_PER_MM_CONVEYOR);
-                stepperConveyor.setSpeed(CONVEYOR_SPEED_LOW_MMPS * STEPS_PER_MM_CONVEYOR);
-                currentState = STATE_SLOW_SCAN;
-            }
-            break;
-        }
-
-        case STATE_SLOW_SCAN: {
-            stepperConveyor.runSpeed();
-
-            // 检查测径工位到达 (若在高速段尚未触发)
-            if (p0Recorded && !diamMeasured) {
-                long targetDiamSteps = stepP0 + (long)((LASER_OFFSET_MM + DIAM_POINT_MM) * STEPS_PER_MM_CONVEYOR);
-                if (stepperConveyor.currentPosition() >= targetDiamSteps) {
-                    resumeStateAfterMeasure = STATE_SLOW_SCAN;
-                    currentState = STATE_Y_MEASURE;
-                    break;
-                }
-            }
-
-            // 传感器 2 捕获绿白分界点
-            ColorSample s2 = readSensor2();
-            if (!boundaryRecorded && s2.getType() == ColorType::WHITE) {
-                stepBoundary = stepperConveyor.currentPosition();
-                boundaryRecorded = true;
-                if (p0Recorded && stepBoundary >= stepP0) {
-                    measuredGreenLength = (float)(stepBoundary - stepP0) / STEPS_PER_MM_CONVEYOR;
-                }
-                Serial.printf("[Head] Green-White boundary at %ld steps. Green Length: %.1f mm\n",
-                              stepBoundary, measuredGreenLength);
-            }
-
-            // 传感器 2 恢复背景底色 (芦笋尾部离开)
-            if (boundaryRecorded && s2.getType() == ColorType::BACKGROUND) {
-                Serial.println("[Head] Tail cleared sensor #2. Pausing conveyor to wait downstream IDLE.");
-                stepperConveyor.stop();
-                stateEntryTime = millis();
-                currentState = STATE_WAIT_DOWNSTREAM;
-            }
-            break;
-        }
-
-        case STATE_Y_MEASURE: {
-            performYMeasure();
-            // 恢复推进
-            if (resumeStateAfterMeasure == STATE_FAST_ADV) {
-                stepperConveyor.setSpeed(CONVEYOR_SPEED_HIGH_MMPS * STEPS_PER_MM_CONVEYOR);
             } else {
-                stepperConveyor.setSpeed(CONVEYOR_SPEED_LOW_MMPS * STEPS_PER_MM_CONVEYOR);
+                objectDetectCounter = 0;
             }
-            currentState = resumeStateAfterMeasure;
+            break;
+        }
+
+        case STATE_TRANSPORT_INSPECT: {
+            totalObjectSampleCount++;
+            ColorType ct = sample.getType();
+            if (ct == ColorType::GREEN) {
+                greenSampleCount++;
+            } else if (ct == ColorType::WHITE) {
+                whiteSampleCount++;
+            }
+
+            // 判断物料尾部是否离开 (读数恢复背景底色)
+            if (ct == ColorType::BACKGROUND) {
+                if (++objectLeaveCounter >= COLOR_CONFIRM_SAMPLES) {
+                    objectLeaveCounter = 0;
+                    motorStop(); // 尾部离开检测区，立即停机
+                    Serial.printf("[HEAD] Object tail passed. Samples: Total=%u, Green=%u, White=%u\n",
+                                  totalObjectSampleCount, greenSampleCount, whiteSampleCount);
+                    switchState(STATE_WAIT_DOWNSTREAM);
+                }
+            } else {
+                objectLeaveCounter = 0;
+            }
+
+            // 防卡料与超时保护
+            if (now - stateEntryTime > MAX_RUN_TIME_MS) {
+                motorStop();
+                Serial.println("[HEAD] ERROR: Feed timeout! Entering FAULT state.");
+                switchState(STATE_FAULT);
+            }
             break;
         }
 
         case STATE_WAIT_DOWNSTREAM: {
-            // 原地停机，等待后机通告 IDLE
+            motorStop();
+
+#if STANDALONE_DEBUG_MODE
+            // 单机调试模式：直接越过下游握手
+            Serial.println("[HEAD] Standalone mode: Bypassing downstream check.");
+            sendMeasureReport("OK");
+            motorForward(MOTOR_SPEED_HANDOFF);
+            switchState(STATE_HANDOFF);
+#else
+            // 工业背压互锁：检查下游 body_1 状态
             if (downstreamState == NodeState::IDLE) {
-                Serial.println("[Head] Downstream is IDLE! Sending data and handing off asparagus.");
-                
-                // 发送数据报文给后机
-                MeasureReport rep;
-                rep.item_id = currentItemId++;
-                rep.green_length_mm = measuredGreenLength;
-                rep.diameter_mm = measuredDiameter;
-                if (!diamMeasured) strcpy(rep.status, "NO_DIAMETER");
-                else strcpy(rep.status, "OK");
-
-                char jsonBuffer[128];
-                if (rep.serialize(jsonBuffer, sizeof(jsonBuffer))) {
-                    Serial2.print(jsonBuffer);
-                    Serial.printf("[Head] TX -> Body: %s", jsonBuffer);
-                }
-
-                // 启动交接出料位移
-                ejectTargetStep = stepperConveyor.currentPosition() + (long)(EJECT_DISTANCE_MM * STEPS_PER_MM_CONVEYOR);
-                stepperConveyor.setMaxSpeed(CONVEYOR_SPEED_LOW_MMPS * STEPS_PER_MM_CONVEYOR);
-                stepperConveyor.moveTo(ejectTargetStep);
-                currentState = STATE_EJECT;
-            } else {
-                if (millis() - stateEntryTime > DOWNSTREAM_TIMEOUT_MS) {
-                    Serial.printf("[Head] WARNING: Downstream busy timeout! (Current: %s). Still waiting...\n",
-                                  nodeStateToString(downstreamState));
-                    stateEntryTime = millis();
-                }
+                const char* qualityStatus = (greenSampleCount >= whiteSampleCount) ? "OK" : "WHITE_ROOT";
+                Serial.printf("[HEAD] Downstream IDLE confirmed. Quality: %s\n", qualityStatus);
+                sendMeasureReport(qualityStatus);
+                motorForward(MOTOR_SPEED_HANDOFF);
+                switchState(STATE_HANDOFF);
+            } else if (now - stateEntryTime > DOWNSTREAM_TIMEOUT_MS) {
+                Serial.printf("[HEAD] WARNING: Downstream wait timeout! Current state: %s. Continuing wait...\n",
+                              nodeStateToString(downstreamState));
+                stateEntryTime = now; // 延长并保持等待
             }
+#endif
             break;
         }
 
-        case STATE_EJECT: {
-            stepperConveyor.run();
-            if (stepperConveyor.distanceToGo() == 0) {
-                Serial.println("[Head] Handoff complete. Resetting to IDLE.");
-                currentState = STATE_IDLE;
+        case STATE_HANDOFF: {
+            // 推料交接计时
+            if (now - stateEntryTime >= HANDOFF_DURATION_MS) {
+                motorStop();
+                Serial.println("[HEAD] Handoff complete. Ready for next asparagus.");
+                switchState(STATE_IDLE);
             }
             break;
         }
 
         case STATE_FAULT: {
-            stepperConveyor.stop();
-            digitalWrite(STATUS_LED_PIN, (millis() / 200) % 2); // 故障闪烁
-            // 串口每隔 3 秒输出一次告警
-            static unsigned long lastFaultLog = 0;
-            if (millis() - lastFaultLog > 3000) {
-                Serial.println("[Head] FAULT STATE. Please check mechanical & sensor status.");
-                lastFaultLog = millis();
+            motorStop();
+            // 在故障状态下，若检测到空载且超时 3 秒后尝试自动恢复 IDLE
+            if (sample.getType() == ColorType::BACKGROUND && (now - stateEntryTime > 3000)) {
+                Serial.println("[HEAD] Fault cleared. Resetting to IDLE.");
+                switchState(STATE_IDLE);
             }
             break;
         }
     }
+
+    delay(20); // 周期步进 20ms (约 50Hz 采样率)
 }
